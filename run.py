@@ -1,92 +1,85 @@
 import os
-import gspread
+import sys
 import loguru
-import youtube_dl
+import yt_dlp as youtube_dl
+import sqlite3
 from path import Path
-from oauth2client.service_account import ServiceAccountCredentials
+from enum import IntEnum
 
-SCOPE = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
-]
-SUCCESS_SIGNATURE = "1"
-MAX_RETRIES = 3
-COLUMNS = {
-    "video_link": 0,
-    "placement": 1,
-    "result": 2,
-}
 
+class LinkState(IntEnum):
+    TO_PROCESS = 1
+    TO_DOWNLINK = 2
+    IGNORE = 3
+    DONE = 4
+    ERROR = 5
+
+
+MAX_RETRIES = 5
 logger = loguru.logger
+SOURCE_DB = Path(os.environ.get("SOURCE_DB"))
+DESTINATION = Path(os.environ.get("DESTINATION"))
+
+if not (SOURCE_DB and DESTINATION):
+    raise Exception("Improperly configured, check .env.examples")
 
 
 def dload_with_retries(
     dloader: youtube_dl.YoutubeDL,
-    sheet: gspread.worksheet.Worksheet,
-    link: str,
-    row_number,
+    url: str,
     retry_count: int,
+    remove_errors: bool
 ):
     try:
-        dloader.download([link])
-        # cells start from 1, that's why we add 1
-        sheet.update_cell(row_number, COLUMNS["result"] + 1, SUCCESS_SIGNATURE)
+        dloader.download([url])
+        update_link_state(url, LinkState.DONE)
+       
     except Exception as e:
-        sheet.update_cell(row_number, COLUMNS["result"] + 1, str(e))
         if retry_count < MAX_RETRIES:
             retry_count += 1
             logger.warning(
                 f"Error occured, making retry #{retry_count}; Error: {str(e)}"
             )
-            dload_with_retries(dloader, sheet, link, row_number, retry_count)
+            dload_with_retries(dloader, url, retry_count, remove_errors)
         else:
-            logger.error(f"Ran out of retries for {link} ; Error: {str(e)}")
+            if remove_errors:
+                update_link_state(url, LinkState.DONE)
+            logger.error(f"Ran out of retries for {url} ; Error: {str(e)}")
 
 
-def get_save_path(row):
-    root_folder = Path(os.environ.get("DESTINATION_PATH").strip())
-    if not root_folder.exists():
-        raise Exception(f"Please create root folder {root_folder.abspath()}")
-    path = (
-        root_folder
-        if len(row) < (COLUMNS["placement"] + 1)
-        else root_folder / str(row[COLUMNS["placement"]])
-    )
-    if not path.exists():
-        path.makedirs()
-    return path
+def dload(remove_errors: bool):
+    if not (SOURCE_DB.exists() and DESTINATION.exists()):
+        raise Exception("Source and destination must exist")
+    
 
+    sql = f"SELECT url FROM speclinks where process = {LinkState.TO_DOWNLINK}"
+    con = sqlite3.connect(SOURCE_DB)
+    cur = con.cursor()
+    cur.execute(sql)
+    res = cur.fetchall()
+    con.close()
 
-def check_env():
-    required_envs = ["DESTINATION_PATH", "SHEET_NAME"]
-    missing = [x for x in required_envs if not os.environ.get(x)]
-    if missing:
-        raise Exception(f"Missing required env variables: {','.join(missing)}")
-
-
-def dload():
-    creds = ServiceAccountCredentials.from_json_keyfile_name("token.json", SCOPE)
-    check_env()
-    sheet_name = os.environ.get("SHEET_NAME").strip()
-    client = gspread.authorize(creds)
-    sheet = client.open(sheet_name).sheet1
-    values = sheet.get_all_values()
-
-    for row_number, row in zip(range(1, len(values) + 1), values):
-        if (
-            len(row) == len(COLUMNS)
-            and str(row[COLUMNS["result"]]) == SUCCESS_SIGNATURE
-        ):
-            continue
+    for url in res:
 
         ydl_opts = {
-            "outtmpl": get_save_path(row) / "%(title)s.%(ext)s",
+            "outtmpl": DESTINATION / "%(title)s.%(ext)s",
         }
 
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            dload_with_retries(ydl, sheet, row[COLUMNS["video_link"]], row_number, 0)
+            dload_with_retries(ydl, url[0], 0, remove_errors)
+
+
+def update_link_state(url, state):
+        sql = "UPDATE speclinks SET process = ? WHERE url = ?"
+        con = sqlite3.connect(SOURCE_DB)
+        cur = con.cursor()
+        cur.execute(sql, [state, url])
+        con.commit()
+        con.close()
 
 
 if __name__ == "__main__":
     logger.info("Welcome to vid downloader. Now sit back and enjoy :)")
-    dload()
+    logger.info("If you need to remove errors, run the app with --remove-errors argument")
+    remove_errors = "--remove-errors" in sys.argv
+    dload(remove_errors)

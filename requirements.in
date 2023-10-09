@@ -4,4 +4,4 @@ loguru
 oauth2client
 path
 pip-tools
-youtube-dl
+yt-dlp
